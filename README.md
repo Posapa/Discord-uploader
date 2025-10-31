@@ -1,1 +1,1 @@
-Did you know you can get free cloud storage for free? You can do it by creating a discord bot and replacing the token and the channel you can send unlimited files that will split into parts and you can redownload them aio
+A simple PyQt5-based GUI for uploading large files to Discord (by splitting them into chunks) and rebuilding them later.

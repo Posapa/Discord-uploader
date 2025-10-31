@@ -1,0 +1,176 @@
+# ============================================================
+# DiUploader
+# ------------------------------------------------------------
+# Description:
+#     A simple PyQt5-based GUI for uploading large files to Discord
+#     (by splitting them into chunks) and rebuilding them later.
+#
+# Requirements:
+#     pip install discord.py PyQt5 requests
+#
+# Notes:
+#     - Discord has a file upload limit per chunk (10MB)
+#     - BOT_TOKEN and CHANNEL_ID must be set before running
+# ============================================================
+import os
+import requests
+import asyncio
+import discord
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QFileDialog, QProgressBar, QMessageBox, QComboBox
+)
+
+BOT_TOKEN = ""
+CHANNEL_ID = 0
+CHUNK_SIZE = 10 * 1024 * 1024
+
+
+class DiscordFileManager(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Discord File Manager")
+        self.setGeometry(300, 300, 500, 320)
+
+        self.file_groups = {}
+        self._setup_ui()
+        asyncio.run(self.populate_file_groups())
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Send or rebuild files from your Discord channel"))
+
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
+
+        self.selector = QComboBox()
+        layout.addWidget(self.selector)
+
+        button_layout = QHBoxLayout()
+
+        send_btn = QPushButton("Send File")
+        send_btn.clicked.connect(self.start_send)
+        button_layout.addWidget(send_btn)
+
+        rebuild_btn = QPushButton("Rebuild Selected")
+        rebuild_btn.clicked.connect(self.start_rebuild)
+        button_layout.addWidget(rebuild_btn)
+
+        refresh_btn = QPushButton("Refresh List")
+        refresh_btn.clicked.connect(lambda: asyncio.run(self.populate_file_groups()))
+        button_layout.addWidget(refresh_btn)
+
+        layout.addLayout(button_layout)
+
+    async def populate_file_groups(self):
+        self.selector.clear()
+
+        intents = discord.Intents.default()
+        intents.message_content = True
+        client = discord.Client(intents=intents)
+
+        @client.event
+        async def on_ready():
+            print("Connected to Discord. Fetching messages...")
+            channel = await client.fetch_channel(CHANNEL_ID)
+
+            messages = []
+            async for msg in channel.history(limit=20000000):
+                messages.append(msg)
+
+            parts = [
+                (a.filename, a.url)
+                for m in messages
+                for a in m.attachments
+                if ".part" in a.filename
+            ]
+
+            self.file_groups.clear()
+            for filename, url in parts:
+                base = filename.rsplit(".part", 1)[0]
+                self.file_groups.setdefault(base, []).append((filename, url))
+
+            for base_name in sorted(self.file_groups.keys()):
+                self.selector.addItem(base_name)
+
+            await client.close()
+            print("File list updated.")
+
+        await client.start(BOT_TOKEN)
+
+    def start_send(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select File to Send")
+        if file_path:
+            asyncio.run(self.send_file(file_path))
+
+    async def send_file(self, file_path):
+        intents = discord.Intents.default()
+        client = discord.Client(intents=intents)
+
+        @client.event
+        async def on_ready():
+            channel = await client.fetch_channel(CHANNEL_ID)
+            file_size = os.path.getsize(file_path)
+            total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+            self.progress.setMaximum(total_chunks)
+            self.progress.setValue(0)
+
+            with open(file_path, "rb") as src:
+                for i in range(total_chunks):
+                    chunk = src.read(CHUNK_SIZE)
+                    part_name = f"{os.path.basename(file_path)}.part{i}"
+
+                    with open(part_name, "wb") as part_file:
+                        part_file.write(chunk)
+
+                    await channel.send(file=discord.File(part_name))
+                    os.remove(part_name)
+                    self.progress.setValue(i + 1)
+
+            QMessageBox.information(self, "Upload Complete", f"Sent {total_chunks} chunks to Discord.")
+            await client.close()
+
+        await client.start(BOT_TOKEN)
+
+    def start_rebuild(self):
+        base_name = self.selector.currentText()
+        if not base_name:
+            QMessageBox.warning(self, "No Selection", "Please select a file group first.")
+            return
+
+        output_path, _ = QFileDialog.getSaveFileName(self, f"Save {base_name} As", base_name)
+        if output_path:
+            asyncio.run(self.rebuild_file(base_name, output_path))
+
+    async def rebuild_file(self, base_name, output_path):
+        parts = sorted(
+            self.file_groups.get(base_name, []),
+            key=lambda x: int(x[0].split(".part")[-1])
+        )
+
+        if not parts:
+            QMessageBox.warning(self, "No Parts Found", f"No parts found for {base_name}.")
+            return
+
+        self.progress.setMaximum(len(parts))
+        self.progress.setValue(0)
+
+        try:
+            with open(output_path, "wb") as out_file:
+                for i, (name, url) in enumerate(parts):
+                    response = requests.get(url)
+                    response.raise_for_status()
+                    out_file.write(response.content)
+                    self.progress.setValue(i + 1)
+
+            QMessageBox.information(self, "Rebuild Complete", f"File saved as:\n{output_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to rebuild file:\n{e}")
+
+
+if __name__ == "__main__":
+    app = QApplication([])
+    window = DiscordFileManager()
+    window.show()
+    app.exec_()
